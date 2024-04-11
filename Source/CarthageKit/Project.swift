@@ -239,8 +239,9 @@ public final class Project { // swiftlint:disable:this type_body_length
 				} else {
 					self._projectEventsObserver.send(value: .downloadingBinaryFrameworkDefinition(.binary(binary), binary.url))
 
-					let request = self.buildURLRequest(for: binary.url, useNetrc: self.useNetrc)
-					return URLSession.proxiedSession.reactive.data(with: request)
+					return self.buildURLRequest(for: binary.url, useNetrc: self.useNetrc)
+						.promoteError(AnyError.self)
+						.flatMap(.latest, URLSession.proxiedSession.reactive.data)
 						.mapError { CarthageError.readFailed(binary.url, $0 as NSError) }
 						.attemptMap { data, _ in
 							return BinaryProject.from(jsonData: data).mapError { error in
@@ -255,6 +256,25 @@ public final class Project { // swiftlint:disable:this type_body_length
 			.startOnQueue(self.cachedBinaryProjectsQueue)
 	}
 
+	/// Returns a SignalProducer with GitHub token value.
+	/// - Returns: A SignalProducer with GitHub token value.
+	private func gitHubAuthenticationToken() -> SignalProducer<String, TaskError> {
+		// Check default ENV vars first.
+		if let token = ["GH_TOKEN", "GITHUB_TOKEN"].compactMap({ ProcessInfo.processInfo.environment[$0] }).first {
+			return SignalProducer(value: token)
+		}
+
+		// Check if gh CLI installed, and get GitHub token from gh CLI.
+		return Task("/usr/bin/which", arguments: ["gh"])
+			.launch()
+			.ignoreTaskData()
+			.map { String(decoding: $0, as: UTF8.self) }
+			.flatMap(.latest) { ghCLIpath in
+				Task(ghCLIpath, arguments: ["auth", "token"]).launch()
+			}
+			.ignoreTaskData()
+			.map { String(decoding: $0, as: UTF8.self) }
+	}
 
 	/// Builds URL request
 	///
@@ -262,20 +282,34 @@ public final class Project { // swiftlint:disable:this type_body_length
 	///   - url: a url that identifies the location of a resource
 	///   - useNetrc: determines whether to use credentials from `~/.netrc` file
 	/// - Returns: a URL request
-	private func buildURLRequest(for url: URL, useNetrc: Bool) -> URLRequest {
-		var request = URLRequest(url: url)
-		guard useNetrc else { return request }
+	private func buildURLRequest(for url: URL, useNetrc: Bool) -> SignalProducer<URLRequest, NoError> {
+		let request = URLRequest(url: url)
 
-		// When downloading a binary, `carthage` will take into account the user's
-		// `~/.netrc` file to determine authentication credentials
-		switch Netrc.load() {
-		case let .success(netrc):
-			if let authorization = netrc.authorization(for: url) {
-				request.addValue(authorization, forHTTPHeaderField: "Authorization")
-			}
-		case .failure(_): break // Do nothing
+		// Attempt to get authorization from ~/.netrc
+		if useNetrc, let authorization = Netrc.load().value?.authorization(for: url) {
+			var request = request
+			request.addValue(authorization, forHTTPHeaderField: "Authorization")
+			return SignalProducer(value: request)
 		}
-		return request
+
+		// Look for GitHub auth token if applicable
+		if let host = url.host,
+		   host == "github.com" || host.hasSuffix(".github.com") {
+
+			return gitHubAuthenticationToken()
+				.map(Optional.some)
+				.flatMapError { _ in .init(value: .none) } // Ignore errors
+				.map { (token: String?) in
+					var request = request
+					if let token {
+						let authorization = "Bearer \(token)"
+						request.addValue(authorization, forHTTPHeaderField: "Authorization")
+					}
+					return request
+				}
+		}
+
+		return SignalProducer(value: request)
 	}
 
 	/// Sends all versions available for the given project.
@@ -1049,8 +1083,9 @@ public final class Project { // swiftlint:disable:this type_body_length
 		if FileManager.default.fileExists(atPath: fileURL.path) {
 			return SignalProducer(value: fileURL)
 		} else {
-			let request = self.buildURLRequest(for: url, useNetrc: self.useNetrc)
-			return URLSession.proxiedSession.reactive.download(with: request)
+			return self.buildURLRequest(for: url, useNetrc: self.useNetrc)
+				.promoteError(AnyError.self)
+				.flatMap(.latest, URLSession.proxiedSession.reactive.download)
 				.on(started: {
 					self._projectEventsObserver.send(value: .downloadingBinaries(dependency, version.description))
 				})
